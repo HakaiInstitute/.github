@@ -1,13 +1,22 @@
 # Opens a quarterly issue prompting a review of who can bypass the security
 # rulesets, and how often they actually did.
 #
-# This exists because the standing `always` bypass has no expiry. The whole
-# justification for allowing direct pushes to a default branch is that someone
-# is watching — an unprompted review is one nobody performs. The issue is the
-# prompt; Rule insights holds the data.
+# This exists because bypass grants have no expiry. The justification for
+# allowing a maintainer to merge past a red check is that someone is watching —
+# an unprompted review is one nobody performs.
 #
-# Needs an org secret with ruleset read access (DRIFT_SCAN_TOKEN works:
-# fine-grained PAT with Administration: Read, or a GitHub App token).
+# DELIBERATELY NEEDS NO PRIVILEGED TOKEN. An earlier version read the bypass
+# lists via the API and pasted them into the issue. That turned out to require
+# organization Administration: **write** — GET /orgs/{org}/rulesets is a write-
+# scoped endpoint, and `bypass_actors` is withheld from anyone with only read.
+# A token that can read rulesets can also delete them, so keeping one in
+# Actions means a workflow change in this repo could disable every security
+# ruleset in the organization.
+#
+# Not worth it for a convenience paste. The issue links to the pages instead
+# and a human reads them, which they have to do to act on it anyway.
+#
+# Uses only the built-in GITHUB_TOKEN.
 
 name: Quarterly bypass review
 
@@ -25,45 +34,6 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Collect the current bypass lists
-        id: collect
-        env:
-          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
-          ORG: ${{ github.repository_owner }}
-        run: |
-          set -uo pipefail
-          : >bypass.md
-
-          # bypass_actors is only returned to callers with write access to the
-          # ruleset; with a read-only token the list comes back empty rather
-          # than erroring, which would quietly make this report look clean.
-          rulesets=$(gh api "orgs/${ORG}/rulesets" 2>/dev/null) || rulesets='[]'
-          count=$(jq 'length' <<<"${rulesets}")
-
-          if [ "${count}" -eq 0 ]; then
-            echo "> Could not read any org rulesets. Check the token has Administration: Read." >>bypass.md
-          fi
-
-          for id in $(jq -r '.[].id' <<<"${rulesets}"); do
-            rs=$(gh api "orgs/${ORG}/rulesets/${id}" 2>/dev/null) || continue
-            name=$(jq -r '.name' <<<"${rs}")
-            enforcement=$(jq -r '.enforcement' <<<"${rs}")
-            {
-              echo "### ${name}"
-              echo
-              echo "Enforcement: \`${enforcement}\`"
-              echo
-              actors=$(jq -r '
-                if (.bypass_actors | length) == 0 then
-                  "_No bypass actors._"
-                else
-                  (.bypass_actors[]
-                   | "- `\(.actor_type)` id `\(.actor_id // "n/a")` — **\(.bypass_mode)**")
-                end' <<<"${rs}")
-              printf '%s\n\n' "${actors}"
-            } >>bypass.md
-          done
-
       - name: Open the review issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -77,24 +47,31 @@ jobs:
             2>/dev/null || true
 
           {
-            echo "Quarterly check on who can bypass the security rulesets."
+            echo "Quarterly check on who can bypass the security rulesets, and whether the"
+            echo "set of gated repositories is still the right one."
             echo
-            echo "The direct-push bypass is a standing, non-expiring grant. This issue is"
-            echo "the only thing that makes it a decision rather than a default."
+            echo "## Look at these"
             echo
-            echo "## Current bypass actors"
+            echo "- **Rule insights** — bypass counts per repository, with CSV export:"
+            echo "  ${GITHUB_SERVER_URL}/organizations/${ORG}/settings/rules/insights"
+            echo "- **Rulesets** — the current bypass list on each:"
+            echo "  ${GITHUB_SERVER_URL}/organizations/${ORG}/settings/rules"
             echo
-            cat bypass.md
             echo "## To do"
             echo
-            echo "- [ ] Open **Rule insights** and check bypass counts per repository:"
-            echo "      ${GITHUB_SERVER_URL}/organizations/${ORG}/settings/rules/insights"
-            echo "- [ ] For each \`always\` actor: still needed, or can it drop to \`pull_request\`?"
+            echo "- [ ] Any \`always\` bypass actor at all? There should be none. If one was"
+            echo "      added, the repo it unblocks probably should not be gated."
             echo "- [ ] Any \`Integration\` actor whose bot is retired — remove it."
-            echo "- [ ] Any repository in the bypass ruleset that no longer needs direct push —"
-            echo "      move it back to the no-bypass ruleset."
-            echo "- [ ] Confirm the hybrid push-scan workflow is still present in every"
-            echo "      bypass repository (\`scripts/05-verify.sh\`)."
+            echo "- [ ] Repositories bypassing often: are they gated prematurely?"
+            echo "- [ ] Re-run the direct-push audit and compare against the gate list:"
+            echo "      \`ORG=${ORG} ./scripts/08-find-direct-pushers.sh\`"
+            echo "- [ ] Any repo that has moved to a pull-request workflow since last"
+            echo "      quarter — add it to the gate list."
+            echo "- [ ] Check whether automation has moved off user accounts yet"
+            echo "      (see MIGRATE-SERVICE-ACCOUNTS.md). If it has, the accounts drop out"
+            echo "      of the audit and more repos become gate candidates."
+            echo "- [ ] Confirm \`GHCR_READ_TOKEN\` has not expired — it is a classic PAT"
+            echo "      and expiry is silent. The image sweep logs \`0 packages\` when it has."
             echo
             echo "Close this issue once reviewed. The next one opens automatically in three months."
             echo
