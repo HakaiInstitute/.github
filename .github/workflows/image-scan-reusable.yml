@@ -1,0 +1,112 @@
+# Build-time container image scan, called by repositories that produce images.
+#
+# Two modes:
+#   image-ref set   → pull and scan that exact image (use after a build-and-push
+#                     step, so you scan the artifact you actually shipped)
+#   image-ref empty → build from the repo's Dockerfile and scan the result
+#                     without pushing (use as a pre-merge gate)
+#
+# This is complementary to the filesystem scan, not a duplicate of it: the fs
+# scan reads your manifests and Dockerfile, this reads the OS packages that
+# ended up in the built layers — base-image CVEs only show up here.
+
+name: Reusable image scan
+
+on:
+  workflow_call:
+    inputs:
+      image-ref:
+        description: Existing image to scan, e.g. ghcr.io/org/app:sha. Empty means build from source.
+        type: string
+        default: ''
+      dockerfile:
+        description: Dockerfile path, when building from source.
+        type: string
+        default: Dockerfile
+      build-context:
+        description: Build context directory, when building from source.
+        type: string
+        default: '.'
+      build-target:
+        description: Optional --target stage, when building from source.
+        type: string
+        default: ''
+      scanners:
+        description: Comma-separated Trivy scanners.
+        type: string
+        default: vuln,secret
+      severity:
+        description: Severities that count as findings.
+        type: string
+        default: CRITICAL,HIGH
+      ignore-unfixed:
+        description: Ignore vulnerabilities with no fix available. Base images often have many.
+        type: boolean
+        default: true
+      fail-on-findings:
+        description: Fail the job on findings. Set false to report only.
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve scan target
+        id: target
+        env:
+          IMAGE_REF: ${{ inputs.image-ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${IMAGE_REF}" ]; then
+            echo "ref=${IMAGE_REF}" >>"$GITHUB_OUTPUT"
+            echo "build=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "ref=local/scan-target:ci" >>"$GITHUB_OUTPUT"
+            echo "build=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out repository
+        if: ${{ steps.target.outputs.build == 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        if: ${{ steps.target.outputs.build == 'true' }}
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.build-context }}
+          TARGET: ${{ inputs.build-target }}
+          TAG: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          args=(build -f "${DOCKERFILE}" -t "${TAG}")
+          [ -n "${TARGET}" ] && args+=(--target "${TARGET}")
+          args+=("${CONTEXT}")
+          docker "${args[@]}"
+
+      - name: Log in to GHCR
+        if: ${{ startsWith(inputs.image-ref, 'ghcr.io/') }}
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "${REGISTRY_TOKEN}" \
+            | docker login ghcr.io -u "${REGISTRY_USER}" --password-stdin
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          scan-ref: ${{ steps.target.outputs.ref }}
+          scanners: ${{ inputs.scanners }}
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          format: table
+          exit-code: ${{ inputs.fail-on-findings && '1' || '0' }}

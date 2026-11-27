@@ -1,0 +1,20 @@
+# CODEOWNERS for <ORG>/.github
+#
+# This repository holds the workflow that executes in every repository's CI.
+# A change here changes what runs across the whole organization, which makes it
+# the highest-leverage file anyone owns. Everything is owned by the security
+# team by default.
+#
+# CODEOWNERS only *requests* review on its own. It blocks nothing unless the
+# ruleset targeting this repository also requires code owner review — see
+# scripts/09-apply-org-rulesets.sh, which carves .github out with no bypass
+# actors and require_code_owner_review: true. The two go together or neither
+# does anything.
+
+* @HakaiInstitute/hakai-tech-security
+
+# Called in every repo's CI. Treat changes here as production changes.
+/.github/workflows/ @HakaiInstitute/hakai-tech-security
+
+# Offered to every new repository under the Actions tab.
+/.github/workflow-templates/ @HakaiInstitute/hakai-tech-security

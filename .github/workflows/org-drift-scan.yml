@@ -1,0 +1,408 @@
+# Scheduled filesystem scan across every repository in the organization.
+#
+# Why this exists: push- and PR-triggered scans only fire when code changes,
+# but vulnerability databases change daily. A repository nobody has touched in
+# a year is the one most likely to be quietly vulnerable. This is the scan that
+# finds those.
+#
+# Lives in <ORG>/.github and runs there — it clones the other repos rather than
+# being installed in them, so nothing has to be rolled out for it to work.
+#
+# Requires an org secret DRIFT_SCAN_TOKEN with read access to every repo:
+#   - fine-grained PAT: Repository access = All repositories,
+#     Contents: Read-only, Metadata: Read-only; or
+#   - a GitHub App installation token (preferred: no expiry to manage).
+# Optional: ALERT_WEBHOOK_URL for a Slack/Teams summary.
+
+name: Org drift scan (filesystem)
+
+on:
+  schedule:
+    # Daily 06:17 UTC. Off the hour on purpose — the top of the hour is the
+    # busiest slot on GitHub's scheduler and runs get delayed.
+    #
+    # Daily, not weekly: the 90-day audit found ~16 direct pushes a day to
+    # default branches, most of them in repos this org does not gate. This
+    # sweep is the primary detection control, not a backstop, so a 7-day
+    # window was too wide. It runs in a public .github repo, where standard
+    # GitHub-hosted runners are free, so cadence costs nothing.
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      severity:
+        description: Severities to report.
+        type: string
+        default: CRITICAL,HIGH
+      only-repos:
+        description: 'Space-separated repo names to limit the sweep to. Empty means all.'
+        type: string
+        default: ''
+      chunk-size:
+        description: Repositories scanned per runner.
+        type: string
+        default: '8'
+      zizmor-min-severity:
+        description: Minimum zizmor finding severity to report.
+        type: string
+        default: medium
+
+permissions: {}
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      chunks: ${{ steps.plan.outputs.chunks }}
+      total: ${{ steps.plan.outputs.total }}
+    steps:
+      - name: Plan the sweep
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          ONLY: ${{ inputs.only-repos }}
+          CHUNK_SIZE: ${{ inputs.chunk-size || '8' }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${ONLY}" ]; then
+            tr ' ' '\n' <<<"${ONLY}" | grep -v '^$' >repos.txt
+          else
+            gh repo list "${ORG}" --no-archived --source --limit 1000 \
+              --json name,defaultBranchRef \
+              | jq -r '.[] | select(.defaultBranchRef != null) | .name' >repos.txt
+          fi
+
+          total=$(grep -c . repos.txt || true)
+          echo "total=${total}" >>"$GITHUB_OUTPUT"
+          echo "Found ${total} repositories to scan."
+
+          # A matrix is capped at 256 jobs. Grow the chunk size until we fit
+          # rather than silently scanning only the first 256 repos.
+          n="${CHUNK_SIZE}"
+          while [ "${total}" -gt 0 ] && [ $(( (total + n - 1) / n )) -gt 256 ]; do
+            n=$(( n * 2 ))
+            echo "::notice::raised chunk size to ${n} to stay under the 256-job matrix cap"
+          done
+
+          jq -R -s -c --argjson n "${n}" '
+            split("\n") | map(select(length > 0))
+            | to_entries
+            | group_by(.key / $n | floor)
+            | map(map(.value) | join(" "))
+          ' repos.txt >chunks.json
+          echo "chunks=$(cat chunks.json)" >>"$GITHUB_OUTPUT"
+
+  scan:
+    needs: discover
+    if: ${{ needs.discover.outputs.total != '0' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      fail-fast: false
+      # Keep a lid on concurrent Actions minutes and on GHCR pulls of the Trivy DB.
+      max-parallel: 8
+      matrix:
+        chunk: ${{ fromJSON(needs.discover.outputs.chunks) }}
+    steps:
+      - name: Install Trivy
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          # Literal, not an env reference: setup-trivy only caches a pinned
+          # version, and zizmor's unpinned-tools audit can't see through `env`.
+          version: v0.70.0
+          cache: true
+
+      - name: Restore Trivy vulnerability database
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}-${{ strategy.job-index }}
+          restore-keys: trivy-db-
+
+      - name: Scan each repository in this chunk
+        env:
+          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          CHUNK: ${{ matrix.chunk }}
+          SEVERITY: ${{ inputs.severity || 'CRITICAL,HIGH' }}
+        run: |
+          # No -e: one bad repo must not abort the rest of the chunk.
+          set -uo pipefail
+          mkdir -p results
+
+          for repo in ${CHUNK}; do
+            echo "::group::${repo}"
+            rm -rf work
+            if ! gh repo clone "${ORG}/${repo}" work -- --depth 1 --quiet 2>/dev/null; then
+              echo "::warning title=${repo}::clone failed (permissions? empty repo?)"
+              echo "::endgroup::"
+              continue
+            fi
+            if ! trivy fs --quiet --scanners vuln,secret,misconfig \
+                 --severity "${SEVERITY}" --ignore-unfixed \
+                 --format json --output "results/${repo}.json" work; then
+              echo "::warning title=${repo}::trivy exited non-zero"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Upload chunk results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: drift-${{ strategy.job-index }}
+          path: results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Separate from the Trivy sweep on purpose. A change to .github/workflows is
+  # the most dangerous thing anyone can push directly to a default branch, and
+  # Trivy does not look at workflow logic at all. Without this, the weekly scan
+  # is blind to exactly the attack the bypass makes possible.
+  zizmor:
+    needs: discover
+    if: ${{ needs.discover.outputs.total != '0' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        chunk: ${{ fromJSON(needs.discover.outputs.chunks) }}
+    steps:
+      - name: Install uv
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+
+      - name: Audit each repository's workflows
+        env:
+          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+          CHUNK: ${{ matrix.chunk }}
+          MIN_SEVERITY: ${{ inputs.zizmor-min-severity || 'medium' }}
+        run: |
+          set -uo pipefail
+          mkdir -p zizmor-results
+
+          for repo in ${CHUNK}; do
+            echo "::group::${repo}"
+            rm -rf work
+            if ! gh repo clone "${ORG}/${repo}" work -- --depth 1 --quiet 2>/dev/null; then
+              echo "::warning title=${repo}::clone failed"
+              echo "::endgroup::"
+              continue
+            fi
+            if [ ! -d "work/.github/workflows" ]; then
+              echo "no workflows"
+              echo "::endgroup::"
+              continue
+            fi
+            # zizmor has no --output flag; it writes the report to stdout.
+            # Exit codes: 0 clean, 11-14 findings by severity, 1 audit error,
+            # 3 nothing collected. Only 11-14 are real findings.
+            uvx zizmor@1.33.1 --no-online-audits --no-progress \
+              --min-severity "${MIN_SEVERITY}" \
+              --format json \
+              work/.github/workflows >"zizmor-results/${repo}.json"
+            rc=$?
+            case "${rc}" in
+              0|3) : ;;
+              11|12|13|14) echo "::warning title=${repo}::zizmor findings (exit ${rc})" ;;
+              *) echo "::warning title=${repo}::zizmor audit error (exit ${rc})" ;;
+            esac
+            echo "::endgroup::"
+          done
+
+      - name: Upload zizmor results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zizmor-${{ strategy.job-index }}
+          path: zizmor-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: [discover, scan, zizmor]
+    if: ${{ always() && needs.discover.outputs.total != '0' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Writes the findings into a tracking issue on this repo (<ORG>/.github).
+      issues: write
+    steps:
+      - name: Download Trivy results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: results
+          pattern: drift-*
+          merge-multiple: true
+
+      - name: Download zizmor results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: zizmor-results
+          pattern: zizmor-*
+          merge-multiple: true
+
+      - name: Build report
+        id: build
+        env:
+          ORG: ${{ github.repository_owner }}
+          SEVERITY: ${{ inputs.severity || 'CRITICAL,HIGH' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Issues cannot be assigned to a team, so the team is mentioned in the
+          # body instead, which notifies every member.
+          OWNER_TEAM: '@${{ github.repository_owner }}/hakai-tech-security'
+        run: |
+          set -euo pipefail
+
+          # Trivy reports findings under three different keys; a misconfiguration
+          # is only a finding when its Status is FAIL.
+          jq_counts='
+            [ (.Results[]?.Vulnerabilities[]?      | .Severity),
+              (.Results[]?.Secrets[]?              | .Severity),
+              (.Results[]?.Misconfigurations[]?    | select(.Status == "FAIL") | .Severity) ]
+            | { critical: (map(select(. == "CRITICAL")) | length),
+                high:     (map(select(. == "HIGH"))     | length) }'
+
+          : >rows.tsv
+          for f in results/*.json; do
+            [ -e "$f" ] || continue
+            repo=$(basename "$f" .json)
+            counts=$(jq -c "${jq_counts}" "$f" 2>/dev/null) || counts='{"critical":0,"high":0}'
+            c=$(jq -r '.critical' <<<"${counts}")
+            h=$(jq -r '.high' <<<"${counts}")
+            [ "$c" -eq 0 ] && [ "$h" -eq 0 ] && continue
+            printf '%s\t%s\t%s\n' "$repo" "$c" "$h" >>rows.tsv
+          done
+
+          # zizmor emits a flat JSON array of findings; severity lives at
+          # .determinations.severity and is capitalised. `ignored` marks
+          # findings suppressed by in-repo ignore comments.
+          : >zizmor.tsv
+          for f in zizmor-results/*.json; do
+            [ -e "$f" ] || continue
+            repo=$(basename "$f" .json)
+            z=$(jq -c '
+              [ .[]? | select(.ignored != true) | .determinations.severity ]
+              | { high:   (map(select(. == "High"))   | length),
+                  medium: (map(select(. == "Medium")) | length) }' "$f" 2>/dev/null) \
+              || z='{"high":0,"medium":0}'
+            zh=$(jq -r '.high' <<<"$z"); zm=$(jq -r '.medium' <<<"$z")
+            [ "$zh" -eq 0 ] && [ "$zm" -eq 0 ] && continue
+            printf '%s\t%s\t%s\n' "$repo" "$zh" "$zm" >>zizmor.tsv
+          done
+
+          scanned=$(ls -1 results/*.json 2>/dev/null | wc -l | tr -d ' ')
+          affected=$(grep -c . rows.tsv || true)
+          crit_total=$(awk -F'\t' '{s+=$2} END {print s+0}' rows.tsv)
+          high_total=$(awk -F'\t' '{s+=$3} END {print s+0}' rows.tsv)
+          z_affected=$(grep -c . zizmor.tsv || true)
+          z_high=$(awk -F'\t' '{s+=$2} END {print s+0}' zizmor.tsv)
+
+          {
+            echo "## Org drift scan"
+            echo
+            echo "Scanned **${scanned}** repositories at severity \`${SEVERITY}\`."
+            echo "**${affected}** have dependency/secret/IaC findings: **${crit_total}** critical, **${high_total}** high."
+            echo "**${z_affected}** have GitHub Actions workflow findings: **${z_high}** high."
+            echo
+            if [ "${affected}" -gt 0 ]; then
+              echo "### Trivy — dependencies, secrets, IaC"
+              echo
+              echo "| Repository | Critical | High |"
+              echo "|---|---:|---:|"
+              # Worst first.
+              sort -t$'\t' -k2,2nr -k3,3nr rows.tsv | while IFS=$'\t' read -r r c h; do
+                echo "| [${r}](${GITHUB_SERVER_URL}/${ORG}/${r}) | ${c} | ${h} |"
+              done
+              echo
+            fi
+            if [ "${z_affected}" -gt 0 ]; then
+              echo "### zizmor — GitHub Actions workflows"
+              echo
+              echo "Workflow findings matter disproportionately: a workflow runs with repository"
+              echo "credentials on every push. Treat High here as you would a Critical above."
+              echo
+              echo "| Repository | High | Medium |"
+              echo "|---|---:|---:|"
+              sort -t$'\t' -k2,2nr -k3,3nr zizmor.tsv | while IFS=$'\t' read -r r h m; do
+                echo "| [${r}](${GITHUB_SERVER_URL}/${ORG}/${r}) | ${h} | ${m} |"
+              done
+              echo
+            fi
+            if [ "${affected}" -eq 0 ] && [ "${z_affected}" -eq 0 ]; then
+              echo "No findings. 🎉"
+              echo
+            fi
+            echo "[Full logs and per-repo JSON artifacts](${RUN_URL})"
+            echo
+            echo "---"
+            echo
+            echo "cc ${OWNER_TEAM} — this issue is updated in place each week and closed automatically when clean."
+          } >report.md
+
+          cat report.md >>"$GITHUB_STEP_SUMMARY"
+          total_affected=$(( affected + z_affected ))
+          {
+            echo "affected=${total_affected}"
+            echo "crit_total=${crit_total}"
+            echo "high_total=${high_total}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upsert tracking issue
+        if: ${{ steps.build.outputs.affected != '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh label create security-drift --repo "${REPO}" \
+            --color B60205 --description "Open findings from the scheduled org drift scan" \
+            2>/dev/null || true
+
+          existing=$(gh issue list --repo "${REPO}" --label security-drift \
+            --state open --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ -n "${existing}" ]; then
+            gh issue edit "${existing}" --repo "${REPO}" --body-file report.md
+            echo "Updated issue #${existing}"
+          else
+            gh issue create --repo "${REPO}" --label security-drift \
+              --title "Security drift: open findings across the organization" \
+              --body-file report.md
+          fi
+
+      - name: Close the tracking issue when clean
+        if: ${{ steps.build.outputs.affected == '0' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --repo "${REPO}" --label security-drift \
+            --state open --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "${existing}" ]; then
+            gh issue close "${existing}" --repo "${REPO}" \
+              --comment "Latest drift scan found no CRITICAL or HIGH findings."
+          fi
+
+      - name: Notify webhook
+        if: ${{ steps.build.outputs.affected != '0' }}
+        env:
+          WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          AFFECTED: ${{ steps.build.outputs.affected }}
+          CRIT: ${{ steps.build.outputs.crit_total }}
+          HIGH: ${{ steps.build.outputs.high_total }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "ALERT_WEBHOOK_URL is not set; skipping notification."
+            exit 0
+          fi
+          payload=$(jq -n \
+            --arg affected "${AFFECTED}" --arg crit "${CRIT}" \
+            --arg high "${HIGH}" --arg url "${RUN_URL}" \
+            '{text: "📉 Org drift scan: \($affected) repos with findings (\($crit) critical, \($high) high)\n\($url)"}')
+          curl -sS --fail-with-body -X POST \
+            -H 'Content-Type: application/json' \
+            --data "${payload}" "${WEBHOOK_URL}"

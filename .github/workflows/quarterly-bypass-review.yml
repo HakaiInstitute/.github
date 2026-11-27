@@ -1,0 +1,105 @@
+# Opens a quarterly issue prompting a review of who can bypass the security
+# rulesets, and how often they actually did.
+#
+# This exists because the standing `always` bypass has no expiry. The whole
+# justification for allowing direct pushes to a default branch is that someone
+# is watching — an unprompted review is one nobody performs. The issue is the
+# prompt; Rule insights holds the data.
+#
+# Needs an org secret with ruleset read access (DRIFT_SCAN_TOKEN works:
+# fine-grained PAT with Administration: Read, or a GitHub App token).
+
+name: Quarterly bypass review
+
+on:
+  schedule:
+    # 09:13 UTC on the 1st of Jan, Apr, Jul, Oct.
+    - cron: '13 9 1 1,4,7,10 *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  open-review:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Collect the current bypass lists
+        id: collect
+        env:
+          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          : >bypass.md
+
+          # bypass_actors is only returned to callers with write access to the
+          # ruleset; with a read-only token the list comes back empty rather
+          # than erroring, which would quietly make this report look clean.
+          rulesets=$(gh api "orgs/${ORG}/rulesets" 2>/dev/null) || rulesets='[]'
+          count=$(jq 'length' <<<"${rulesets}")
+
+          if [ "${count}" -eq 0 ]; then
+            echo "> Could not read any org rulesets. Check the token has Administration: Read." >>bypass.md
+          fi
+
+          for id in $(jq -r '.[].id' <<<"${rulesets}"); do
+            rs=$(gh api "orgs/${ORG}/rulesets/${id}" 2>/dev/null) || continue
+            name=$(jq -r '.name' <<<"${rs}")
+            enforcement=$(jq -r '.enforcement' <<<"${rs}")
+            {
+              echo "### ${name}"
+              echo
+              echo "Enforcement: \`${enforcement}\`"
+              echo
+              actors=$(jq -r '
+                if (.bypass_actors | length) == 0 then
+                  "_No bypass actors._"
+                else
+                  (.bypass_actors[]
+                   | "- `\(.actor_type)` id `\(.actor_id // "n/a")` — **\(.bypass_mode)**")
+                end' <<<"${rs}")
+              printf '%s\n\n' "${actors}"
+            } >>bypass.md
+          done
+
+      - name: Open the review issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ORG: ${{ github.repository_owner }}
+          OWNER_TEAM: '@${{ github.repository_owner }}/hakai-tech-security'
+        run: |
+          set -euo pipefail
+          gh label create bypass-review --repo "${REPO}" \
+            --color 0E8A16 --description "Quarterly review of ruleset bypass actors" \
+            2>/dev/null || true
+
+          {
+            echo "Quarterly check on who can bypass the security rulesets."
+            echo
+            echo "The direct-push bypass is a standing, non-expiring grant. This issue is"
+            echo "the only thing that makes it a decision rather than a default."
+            echo
+            echo "## Current bypass actors"
+            echo
+            cat bypass.md
+            echo "## To do"
+            echo
+            echo "- [ ] Open **Rule insights** and check bypass counts per repository:"
+            echo "      ${GITHUB_SERVER_URL}/organizations/${ORG}/settings/rules/insights"
+            echo "- [ ] For each \`always\` actor: still needed, or can it drop to \`pull_request\`?"
+            echo "- [ ] Any \`Integration\` actor whose bot is retired — remove it."
+            echo "- [ ] Any repository in the bypass ruleset that no longer needs direct push —"
+            echo "      move it back to the no-bypass ruleset."
+            echo "- [ ] Confirm the hybrid push-scan workflow is still present in every"
+            echo "      bypass repository (\`scripts/05-verify.sh\`)."
+            echo
+            echo "Close this issue once reviewed. The next one opens automatically in three months."
+            echo
+            echo "cc ${OWNER_TEAM}"
+          } >issue.md
+
+          gh issue create --repo "${REPO}" --label bypass-review \
+            --title "Quarterly bypass review" --body-file issue.md
