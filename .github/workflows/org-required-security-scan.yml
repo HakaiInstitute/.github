@@ -35,7 +35,13 @@ jobs:
 
       - name: Scan filesystem with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
         with:
+          # The action's own default is Trivy v0.70.0, which silently SKIPS
+          # misconfiguration policies requiring 0.72.0+. Pin the scanner
+          # separately from the action.
+          version: v0.76.2
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret,misconfig

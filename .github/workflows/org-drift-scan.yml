@@ -10,8 +10,14 @@
 #
 # Requires an org secret DRIFT_SCAN_TOKEN with read access to every repo:
 #   - fine-grained PAT: Repository access = All repositories,
-#     Contents: Read-only, Metadata: Read-only; or
-#   - a GitHub App installation token (preferred: no expiry to manage).
+#     Contents: Read-only, Metadata: Read-only. Nothing else; or
+#   - a GitHub App installation token (no expiry to manage).
+#
+# Deliberately NOT the same token as GHCR_READ_TOKEN. The container registry
+# only accepts classic PATs, and a classic PAT broad enough to read every
+# private repo carries `repo` — write access to all of them — for a job that
+# only ever reads. Two narrow tokens beat one wide one.
+#
 # Optional: ALERT_WEBHOOK_URL for a Slack/Teams summary.
 
 name: Org drift scan (filesystem)
@@ -111,7 +117,8 @@ jobs:
         with:
           # Literal, not an env reference: setup-trivy only caches a pinned
           # version, and zizmor's unpinned-tools audit can't see through `env`.
-          version: v0.70.0
+          # 0.72.0+ is required or some misconfiguration policies are skipped.
+          version: v0.76.2
           cache: true
 
       - name: Restore Trivy vulnerability database
@@ -127,6 +134,7 @@ jobs:
           ORG: ${{ github.repository_owner }}
           CHUNK: ${{ matrix.chunk }}
           SEVERITY: ${{ inputs.severity || 'CRITICAL,HIGH' }}
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
         run: |
           # No -e: one bad repo must not abort the rest of the chunk.
           set -uo pipefail

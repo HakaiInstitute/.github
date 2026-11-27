@@ -5,9 +5,19 @@
 # rebuilt accumulates base-layer CVEs without a single commit landing. Nothing
 # in the push/PR pipeline will ever look at it again. This does.
 #
-# Requires org secret DRIFT_SCAN_TOKEN with package read access:
-#   - classic PAT with read:packages (+ read:org), or
-#   - a GitHub App installation token with Packages: Read.
+# Requires org secret GHCR_READ_TOKEN: a CLASSIC personal access token with
+# `read:packages` and `read:org`.
+#
+# It must be classic. GitHub's own docs: "GitHub Packages only supports
+# authentication using a personal access token (classic)." Fine-grained PATs
+# are rejected, and so are GitHub App installation tokens — `docker login`
+# appears to succeed and `docker pull` then fails with `denied`. The workflow's
+# own GITHUB_TOKEN is no help either: it is scoped to this repository, not to
+# packages linked to other repos.
+#
+# This is the one place in the rollout that needs a classic PAT. Give it a
+# calendar expiry and a rotation owner.
+#
 # Optional: ALERT_WEBHOOK_URL.
 
 name: Org drift scan (container images)
@@ -44,7 +54,7 @@ jobs:
       - name: List container packages
         id: plan
         env:
-          GH_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          GH_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
           ORG: ${{ github.repository_owner }}
           TAGS_PER_PACKAGE: ${{ inputs.tags-per-package || '1' }}
         run: |
@@ -94,7 +104,8 @@ jobs:
         with:
           # Literal, not an env reference: setup-trivy only caches a pinned
           # version, and zizmor's unpinned-tools audit can't see through `env`.
-          version: v0.70.0
+          # 0.72.0+ is required or some misconfiguration policies are skipped.
+          version: v0.76.2
           cache: true
 
       - name: Restore Trivy vulnerability database
@@ -106,7 +117,7 @@ jobs:
 
       - name: Log in to GHCR
         env:
-          REGISTRY_TOKEN: ${{ secrets.DRIFT_SCAN_TOKEN }}
+          REGISTRY_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
           REGISTRY_USER: ${{ github.repository_owner }}
         run: |
           printf '%s' "${REGISTRY_TOKEN}" \
@@ -116,6 +127,7 @@ jobs:
         env:
           IMAGE: ${{ matrix.image }}
           SEVERITY: ${{ inputs.severity || 'CRITICAL,HIGH' }}
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
           IGNORE_UNFIXED: ${{ inputs.ignore-unfixed && '--ignore-unfixed' || '' }}
         run: |
           set -uo pipefail
